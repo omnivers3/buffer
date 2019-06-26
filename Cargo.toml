@@ -1,0 +1,20 @@
+[package]
+name = "omni_buffer"
+version = "0.1.0"
+authors = [ "Perry Birch" ]
+license = "MIT/Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/omnivers3/buffer"
+
+[dependencies]
+arrayref = "0.3.4"
+log = "0.4.2"
+memsec = "0.5.4"
+
+[lib]
+name = "omni_buffer"
+src = "./src/lib.rs"
+
+[dev-dependencies]
+criterion = "0.2.3"
+env_logger = "0.5.10"
