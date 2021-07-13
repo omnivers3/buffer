@@ -1,10 +1,6 @@
-#![feature(allocator_api)]
-#![feature(const_fn_union)]
-
 extern crate core;
-
-#[macro_use]
 extern crate log;
+extern crate memsec;
 
 // TODO: more robust cache line detection
 // #[cfg(target_pointer_width = "32")]
@@ -12,23 +8,28 @@ extern crate log;
 // #[cfg(target_pointer_width = "64")]
 const CACHE_LINE_SIZE: usize = 64;
 
-extern crate memsec;
-
 use std::cmp::{ max };
-use std::alloc::{ Alloc, Global, Layout };
+use std::alloc::{ alloc_zeroed, dealloc, Layout, LayoutError };
 use std::mem;
 
 #[derive(Debug)]
-pub enum Errors {
-    BufferSizeOverflow,
+pub enum Error {
     AllocCapacityOverflow,
-    InvalidLayout,
+    BufferSizeOverflow,
     InsufficientMemory,
+    LayoutError(LayoutError),
     ZeroBufferNotSupported,
+}
+
+impl From<LayoutError> for Error {
+    fn from(error: LayoutError) -> Self {
+        Error::LayoutError(error)
+    }
 }
 
 #[derive(Debug)]
 pub struct Buffer<'a, T: 'a> {
+    layout: Layout,
     ptr: *mut u8,
     cap: usize,
     size: usize,
@@ -36,46 +37,36 @@ pub struct Buffer<'a, T: 'a> {
     pub entries: Vec<&'a mut T>,
 }
 
-fn zero_buffer<'a, T>() -> Result<Buffer<'a, T>, Errors> {
-    // handles ZSTs and `cap = 0` alike
-    // NonNull::<T>::dangling()
-    Err (Errors::ZeroBufferNotSupported)
-}
-
-fn buffer_from<'a, T>(cap: usize, size: usize, padded_size: usize, alloc_size: usize) -> Result<Buffer<'a, T>, Errors> {
+fn buffer_from<'a, T>(cap: usize, size: usize, padded_size: usize, alloc_size: usize) -> Result<Buffer<'a, T>, Error> {
     let align = mem::align_of::<T>();
-    Layout::from_size_align(alloc_size, align)
-        .map_err(|err| {
-            error!("Error creating layout for Buffer: {:?}", err);
-            Errors::InvalidLayout
-        })
-        .and_then(|layout| {
+    let layout = Layout::from_size_align(alloc_size, align)?;
+    // Heap allocation can yield undefined behavior if not checked to ensure non null pointer result
+    // https://specs.amethyst.rs/docs/api/nom/lib/std/alloc/trait.globalalloc#tymethod.alloc
+    let ptr = unsafe {
+        let raw_ptr = alloc_zeroed(layout); // Heap allocation
+        // See assertion example of non zero pointer:
+        // https://edp.fortanix.com/docs/api/std/alloc/fn.alloc_zeroed.html
+        if *(raw_ptr as *mut u16) != 0 {
+            return Err(Error::InsufficientMemory);
+        }
+        raw_ptr as *mut u8
+    };
+    let mut entries: Vec<&mut T> = Vec::with_capacity(cap);
+    for i in 0..cap {
+        entries.push(
             unsafe {
-                Global.alloc_zeroed(layout) // Heap allocation
+                mem::transmute(ptr.add(i * padded_size))
             }
-            .map_err(|err| {
-                error!("Error allocating heap for Buffer: {:?}", err);
-                Errors::InsufficientMemory
-            })
-        })
-        .map(|ptr| {
-            let ptr: *mut u8 = ptr.as_ptr() as *mut u8;
-            let mut entries: Vec<&mut T> = Vec::with_capacity(cap);
-            for i in 0..cap {
-                entries.push(
-                    unsafe {
-                        mem::transmute(ptr.add(i * padded_size))
-                    }
-                );
-            }
-            Buffer {
-                ptr,
-                cap,
-                size,
-                padded_size,
-                entries,
-            }
-        })
+        );
+    }
+    Ok(Buffer {
+        layout,
+        ptr,
+        cap,
+        size,
+        padded_size,
+        entries,
+    })
 }
 
 enum Padding {
@@ -84,7 +75,7 @@ enum Padding {
     CacheAligned,
 }
 
-fn new<'a, T>(cap: usize, padding: Padding) -> Result<Buffer<'a, T>, Errors> {
+fn new<'a, T>(cap: usize, padding: Padding) -> Result<Buffer<'a, T>, Error> {
     let size = mem::size_of::<T>();
     let padded_size: usize = match padding {
         Padding::None => size,
@@ -101,31 +92,31 @@ fn new<'a, T>(cap: usize, padding: Padding) -> Result<Buffer<'a, T>, Errors> {
             }
         }
     };
-
-    cap
-        .checked_mul(padded_size)
-        .ok_or(Errors::BufferSizeOverflow)
-        .and_then(alloc_guard)
-        .and_then(|alloc_size| {
-            if alloc_size == 0 {
-                // NonNull::<T>::dangling()
-                zero_buffer()
-            } else {
-                buffer_from::<T>(cap, size, padded_size, alloc_size)
-            }
-        })
+    let alloc_size = cap.checked_mul(padded_size)
+        .ok_or(Error::BufferSizeOverflow)
+        .and_then(alloc_guard)?;
+    if alloc_size == 0 {
+        return Err (Error::ZeroBufferNotSupported)
+    }
+    buffer_from::<T>(cap, size, padded_size, alloc_size)
 }
 
 impl <'a, T: 'a> Buffer<'a, T> {
-    pub fn new(cap: usize) -> Result<Self, Errors> {
+    pub fn new(cap: usize) -> Result<Self, Error> {
         new(cap, Padding::None)
     }
 
-    pub fn padded(cap: usize, padded_size: usize) -> Result<Self, Errors> {
+    pub fn dealloc(self) {
+        unsafe {
+            dealloc(self.ptr, self.layout)
+        }
+    }
+
+    pub fn padded(cap: usize, padded_size: usize) -> Result<Self, Error> {
         new(cap, Padding::Padded(padded_size))
     }
 
-    pub fn cache_aligned(cap: usize) -> Result<Self, Errors> {
+    pub fn cache_aligned(cap: usize) -> Result<Self, Error> {
         new(cap, Padding::CacheAligned)
     }
 
@@ -179,9 +170,9 @@ impl <'a, T: 'a> Buffer<'a, T> {
 // an extra guard for this in case we're running on a platform which can use
 // all 4GB in user-space. e.g. PAE or x32
 #[inline]
-fn alloc_guard(alloc_size: usize) -> Result<usize, Errors> {
+fn alloc_guard(alloc_size: usize) -> Result<usize, Error> {
     if mem::size_of::<usize>() < 8 && alloc_size > ::core::isize::MAX as usize {
-        Err(Errors::AllocCapacityOverflow)
+        Err(Error::AllocCapacityOverflow)
     } else {
         Ok(alloc_size)
     }
@@ -190,26 +181,12 @@ fn alloc_guard(alloc_size: usize) -> Result<usize, Errors> {
 #[cfg(test)]
 mod tests {
     extern crate env_logger;
-    // extern crate heapless;
-
     use super::*;
-
-    // use self::heapless::consts::*;
-
-    // #[derive(Debug)]
-    // struct U8String {
-    //     value: heapless::String<U8>,
-    // }
-
-    // #[derive(Debug)]
-    // struct U32String {
-    //     value: heapless::String<U32>,
-    // }
 
     #[derive(Debug)]
     struct Thing {
-        value1: usize,
-        value2: usize,
+        value1: u64,
+        value2: u64,
     }
 
     #[test]
@@ -227,22 +204,6 @@ mod tests {
         assert_eq!(buf.size(), 4);
         assert_eq!(buf.padded_size(), 4);
     }
-
-    // #[test]
-    // fn should_capture_correct_properties_for_struct_with_u8string() {
-    //     let buf = Buffer::<U8String>::new(1).unwrap();
-    //     assert_eq!(buf.cap(), 1);
-    //     assert_eq!(buf.size(), 16);
-    //     assert_eq!(buf.padded_size(), 16);
-    // }
-
-    // #[test]
-    // fn should_capture_correct_properties_for_struct_with_u32string() {
-    //     let buf = Buffer::<U32String>::new(1).unwrap();
-    //     assert_eq!(buf.cap(), 1);
-    //     assert_eq!(buf.size(), 40);
-    //     assert_eq!(buf.padded_size(), 40);
-    // }
 
     #[test]
     fn should_capture_correct_properties_for_struct_thing() {
