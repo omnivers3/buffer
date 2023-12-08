@@ -7,14 +7,14 @@ readme = "README.md"
 repository = "https://github.com/omnivers3/buffer"
 
 [dependencies]
-arrayref = "0.3.6"
-log = "0.4.14"
-memsec = "0.6.0"
+arrayref = "0.3.7"
+log = "0.4.20"
+memsec = "0.6.3"
 
 [lib]
 name = "omni_buffer"
 src = "./src/lib.rs"
 
 [dev-dependencies]
-criterion = "0.3.4"
-env_logger = "0.8.4"
+criterion = "0.5.1"
+env_logger = "0.10.1"
